@@ -1,0 +1,31 @@
+{
+  "name": "payflow",
+  "version": "1.0.0",
+  "description": "",
+  "keywords": [
+    "payflow",
+    "payment",
+    "app"
+  ],
+  "license": "ISC",
+  "author": "ekak basu",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "nodemon server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "bullmq": "^5.76.2",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.20.0",
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
