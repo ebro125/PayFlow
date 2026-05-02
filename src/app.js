@@ -1,4 +1,4 @@
-const express = require('express');
+const express      = require('express');
 const errorHandler = require('./middleware/errorHandlers');
 
 const app = express();
@@ -6,7 +6,9 @@ const app = express();
 app.use(express.json());
 
 // Routes
-app.use('/api', require('./routes/index'));
+app.use('/api',        require('./routes/index'));
+app.use('/api/auth',   require('./routes/auth'));
+app.use('/api/wallet',  require('./routes/wallet'));
 
 // Central error handler — must be last
 app.use(errorHandler);
