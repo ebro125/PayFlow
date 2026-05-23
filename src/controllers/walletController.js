@@ -1,4 +1,5 @@
-const pool = require('../config/db');
+const pool          = require('../config/db');
+const transferQueue = require('../queues/transferQueue');
 
 // GET /api/wallet/balance
 const getBalance = async (req, res, next) => {
@@ -17,8 +18,11 @@ const getBalance = async (req, res, next) => {
 // POST /api/wallet/deposit  { amount }
 const deposit = async (req, res, next) => {
   const { amount } = req.body;
-  if (!amount || amount <= 0) {
-    return res.status(400).json({ error: 'Amount must be positive' });
+
+  // FIX: validate amount is actually a number, not just truthy
+  const parsed = parseFloat(amount);
+  if (!amount || isNaN(parsed) || parsed <= 0) {
+    return res.status(400).json({ error: 'Amount must be a positive number' });
   }
 
   const client = await pool.connect();
@@ -29,13 +33,13 @@ const deposit = async (req, res, next) => {
       `UPDATE wallets SET balance = balance + $1
        WHERE user_id = $2
        RETURNING balance`,
-      [amount, req.userId]
+      [parsed, req.userId]
     );
 
     await client.query(
       `INSERT INTO transactions (sender_wallet_id, receiver_wallet_id, amount, type, status)
        VALUES (NULL, (SELECT id FROM wallets WHERE user_id = $1), $2, 'deposit', 'completed')`,
-      [req.userId, amount]
+      [req.userId, parsed]
     );
 
     await client.query('COMMIT');
@@ -48,26 +52,34 @@ const deposit = async (req, res, next) => {
   }
 };
 
-// POST /api/wallet/transfer  { to_email, amount }
+// POST /api/wallet/transfer  { to_email, amount, idempotency_key? }
 const transfer = async (req, res, next) => {
   const { to_email, amount, idempotency_key } = req.body;
 
-  if (!to_email || !amount || amount <= 0) {
+  const parsed = parseFloat(amount);
+  if (!to_email || !amount || isNaN(parsed) || parsed <= 0) {
     return res.status(400).json({ error: 'to_email and a positive amount are required' });
   }
 
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
+    // Fetch sender wallet
+    const { rows: senderRows } = await client.query(
+      `SELECT w.id, w.balance FROM wallets w WHERE w.user_id = $1`,
+      [req.userId]
+    );
+    if (!senderRows.length) return res.status(404).json({ error: 'Sender wallet not found' });
+    const sender = senderRows[0];
 
-    // Idempotency check
+    // Idempotency check — scoped to sender
     if (idempotency_key) {
       const { rows: existing } = await client.query(
-        `SELECT id, status FROM transactions WHERE idempotency_key = $1 LIMIT 1`,
-        [idempotency_key]
+        `SELECT id, status FROM transactions
+         WHERE idempotency_key = $1 AND sender_wallet_id = $2
+         LIMIT 1`,
+        [idempotency_key, sender.id]
       );
       if (existing.length) {
-        await client.query('ROLLBACK');
         return res.status(200).json({
           message: 'Duplicate request — original transaction returned',
           transaction_id: existing[0].id,
@@ -76,57 +88,41 @@ const transfer = async (req, res, next) => {
       }
     }
 
-    // Sender wallet (lock row)
-    const { rows: senderRows } = await client.query(
-      `SELECT w.id, w.balance FROM wallets w
-       WHERE w.user_id = $1
-       FOR UPDATE`,
-      [req.userId]
-    );
-    if (!senderRows.length) throw Object.assign(new Error('Sender wallet not found'), { status: 404 });
-
-    const sender = senderRows[0];
-    if (parseFloat(sender.balance) < parseFloat(amount)) {
-      throw Object.assign(new Error('Insufficient balance'), { status: 422 });
+    // Balance check
+    if (parseFloat(sender.balance) < parsed) {
+      return res.status(422).json({ error: 'Insufficient balance' });
     }
 
-    // Receiver wallet (lock row)
+    // Fetch receiver wallet
     const { rows: receiverRows } = await client.query(
       `SELECT w.id FROM wallets w
        JOIN users u ON u.id = w.user_id
-       WHERE u.email = $1
-       FOR UPDATE`,
+       WHERE u.email = $1`,
       [to_email]
     );
-    if (!receiverRows.length) throw Object.assign(new Error('Recipient not found'), { status: 404 });
-
+    if (!receiverRows.length) return res.status(404).json({ error: 'Recipient not found' });
     const receiver = receiverRows[0];
+
     if (receiver.id === sender.id) {
-      throw Object.assign(new Error('Cannot transfer to yourself'), { status: 400 });
+      return res.status(400).json({ error: 'Cannot transfer to yourself' });
     }
 
-    // Debit / credit
-    await client.query(
-      `UPDATE wallets SET balance = balance - $1 WHERE id = $2`,
-      [amount, sender.id]
-    );
-    await client.query(
-      `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
-      [amount, receiver.id]
-    );
+    // Add job to queue — don't wait for it to complete
+    const job = await transferQueue.add('transfer', {
+      senderWalletId:   sender.id,
+      receiverWalletId: receiver.id,
+      amount:           parsed,
+      idempotency_key:  idempotency_key || null,
+    });
 
-    // Record transaction
-    const { rows: txRows } = await client.query(
-      `INSERT INTO transactions (sender_wallet_id, receiver_wallet_id, amount, type, status, idempotency_key)
-       VALUES ($1, $2, $3, 'transfer', 'completed', $4)
-       RETURNING id`,
-      [sender.id, receiver.id, amount, idempotency_key || null]
-    );
+    // Return immediately — worker handles the rest
+    res.status(202).json({
+      message:    'Transfer queued',
+      job_id:     job.id,
+      status:     'queued',
+    });
 
-    await client.query('COMMIT');
-    res.json({ transaction_id: txRows[0].id, status: 'completed' });
   } catch (err) {
-    await client.query('ROLLBACK');
     next(err);
   } finally {
     client.release();
@@ -136,7 +132,6 @@ const transfer = async (req, res, next) => {
 // GET /api/wallet/transactions
 const getTransactions = async (req, res, next) => {
   try {
-    // Resolve caller's wallet id + current balance in one shot
     const { rows: walletRows } = await pool.query(
       'SELECT id, balance FROM wallets WHERE user_id = $1',
       [req.userId]

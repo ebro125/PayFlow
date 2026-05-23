@@ -1,7 +1,7 @@
 const redis = require('../config/redis');
 
-const WINDOW_SECONDS = 60;  // 1 minute window
-const MAX_REQUESTS   = 5;   // max transfers per window
+const WINDOW_SECONDS = 60;
+const MAX_REQUESTS   = 5;
 
 const rateLimiter = async (req, res, next) => {
   const key = `rate:transfer:${req.userId}`;
@@ -9,10 +9,7 @@ const rateLimiter = async (req, res, next) => {
   const windowStart = now - WINDOW_SECONDS * 1000;
 
   try {
-    // Remove timestamps outside the current window
     await redis.zremrangebyscore(key, '-inf', windowStart);
-
-    // Count how many requests are in the current window
     const count = await redis.zcard(key);
 
     if (count >= MAX_REQUESTS) {
@@ -28,19 +25,14 @@ const rateLimiter = async (req, res, next) => {
       });
     }
 
-    // Add current request timestamp to the sorted set
     await redis.zadd(key, now, `${now}`);
-
-    // Set expiry on the key so Redis cleans up idle users
     await redis.expire(key, WINDOW_SECONDS);
 
-    // Pass remaining info to response headers
     res.setHeader('X-RateLimit-Limit', MAX_REQUESTS);
     res.setHeader('X-RateLimit-Remaining', MAX_REQUESTS - count - 1);
 
     next();
   } catch (err) {
-    // If Redis is down, fail open (don't block transfers)
     console.error('Rate limiter error:', err);
     next();
   }
